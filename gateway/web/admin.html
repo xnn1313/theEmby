@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NextEmby-Replay · 管理后台</title>
+<style>
+:root{--bg:#0f1419;--card:#1a2230;--line:#2a3548;--txt:#dbe4f0;--dim:#8b98ad;--acc:#3b82f6;--ok:#22c55e;--bad:#ef4444;--warn:#f59e0b}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+header{padding:16px 24px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:16px}
+header h1{font-size:18px;margin:0}header .dim{color:var(--dim);font-size:12px}
+nav{display:flex;gap:8px;padding:12px 24px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+nav button{background:var(--card);color:var(--txt);border:1px solid var(--line);border-radius:8px;padding:8px 16px;cursor:pointer}
+nav button.on{background:var(--acc);border-color:var(--acc)}
+main{padding:20px 24px;max-width:1200px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 20px;margin-bottom:16px}
+.card h2{font-size:15px;margin:0 0 12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.stat{background:#111826;border:1px solid var(--line);border-radius:10px;padding:12px 16px}
+.stat .v{font-size:22px;font-weight:700}.stat .k{color:var(--dim);font-size:12px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+th{color:var(--dim);font-weight:500}.mono{font-family:ui-monospace,Menlo,monospace;font-size:12px}
+.tag{display:inline-block;padding:2px 10px;border-radius:20px;font-size:12px;background:#243044}
+.tag.ok{background:rgba(34,197,94,.15);color:var(--ok)}.tag.bad{background:rgba(239,68,68,.15);color:var(--bad)}
+.tag.warn{background:rgba(245,158,11,.15);color:var(--warn)}
+button.act{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px}
+button.act.ghost{background:transparent;border:1px solid var(--line);color:var(--txt)}
+input,select{background:#111826;border:1px solid var(--line);color:var(--txt);border-radius:6px;padding:6px 10px;font-size:13px}
+#gate{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:9}
+#gate .card{width:360px}#err{color:var(--bad);font-size:13px;min-height:20px}
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+<div id="gate"><div class="card">
+<h2>管理后台登录</h2>
+<p class="dim" style="color:var(--dim);font-size:12px">输入 NB_ADMIN_TOKEN（未设置时见容器日志）</p>
+<input id="tkin" type="password" style="width:100%;margin-bottom:10px" placeholder="admin token">
+<button class="act" style="width:100%" onclick="login()">进入</button>
+<div id="err"></div>
+</div></div>
+
+<header><h1>🎛️ NextEmby-Replay · 管理后台</h1><span class="dim">MVP · 内存数据（重启丢失）</span></header>
+<nav id="tabs">
+<button data-t="dash" class="on">总览</button>
+<button data-t="users">用户</button>
+<button data-t="pool">池账号</button>
+<button data-t="logs">播放日志</button>
+<button data-t="cfg">配置</button>
+</nav>
+<main>
+<section id="t-dash">
+<div class="card"><h2>今日决策</h2><div class="grid" id="branches"></div></div>
+<div class="card"><h2>缓存与用户</h2><div class="grid" id="misc"></div></div>
+</section>
+<section id="t-users" class="hidden"><div class="card"><h2>用户管理</h2>
+<table><thead><tr><th>ID</th><th>模式</th><th>套餐</th><th>当前并发</th><th>成功/失败</th><th>Cookie</th><th>操作</th></tr></thead><tbody id="users"></tbody></table>
+</div></section>
+<section id="t-pool" class="hidden"><div class="card"><h2>池账号 <span class="dim" style="color:var(--dim);font-size:12px">（每账号最多 3～4 用户锁定）</span></h2>
+<table><thead><tr><th>ID</th><th>健康</th><th>锁定用户数</th><th>上限</th><th>操作</th></tr></thead><tbody id="pool"></tbody></table>
+</div></section>
+<section id="t-logs" class="hidden"><div class="card"><h2>播放日志 <button class="act ghost" onclick="loadLogs()">刷新</button></h2>
+<table><thead><tr><th>时间</th><th>用户</th><th>分支</th><th>账号</th><th>耗时ms</th><th>结果</th></tr></thead><tbody id="logs"></tbody></table>
+</div></section>
+<section id="t-cfg" class="hidden"><div class="card"><h2>配置查看</h2><table><tbody id="cfg"></tbody></table>
+<p style="color:var(--dim);font-size:12px">API Key / Cookie / token 永不经此接口输出。</p></div></section>
+</main>
+<script>
+let TOKEN=new URLSearchParams(location.search).get('token')||'';
+if(TOKEN){document.getElementById('gate').style.display='none';}
+function login(){const v=document.getElementById('tkin').value.trim();if(!v)return;
+ location.search='?token='+encodeURIComponent(v);}
+async function api(p,opt){opt=opt||{};opt.headers=Object.assign({'Authorization':'Bearer '+TOKEN},opt.headers||{});
+ const r=await fetch('/nb/admin/api'+p,opt);
+ if(r.status===401){document.getElementById('gate').style.display='flex';document.getElementById('err').textContent='token 无效';throw 0;}
+ if(!r.ok){const t=await r.text();alert('请求失败 '+r.status+': '+t);throw 0;}return r.json();}
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const branchName={cache_hit:'缓存命中',own_drive_hit:'自有盘命中',p2p_rapid:'用户间秒传',seed_fallback:'源盘兜底',pool_probe_hit:'池探测命中',pool_shield_transfer:'神盾转存',pool_seed_fallback:'池源盘秒传',denied_concurrency:'拒绝·并发超限',denied_no_own_drive:'拒绝·无自有盘',denied_pool_exhausted:'拒绝·池已满',denied_unknown_mode:'拒绝·未知模式',error:'异常'};
+const bn=b=>branchName[b]||b;
+document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#tabs button').forEach(x=>x.classList.remove('on'));b.classList.add('on');
+ document.querySelectorAll('main>section').forEach(s=>s.classList.add('hidden'));document.getElementById('t-'+b.dataset.t).classList.remove('hidden');
+ ({dash:loadDash,users:loadUsers,pool:loadPool,logs:loadLogs,cfg:loadCfg})[b.dataset.t]();});
+async function loadDash(){const s=await api('/stats');
+ document.getElementById('branches').innerHTML=Object.entries(s.branches||{}).map(([k,v])=>'<div class="stat"><div class="v">'+v+'</div><div class="k">'+esc(bn(k))+'</div></div>').join('')||'<div class="stat"><div class="k">今日暂无决策</div></div>';
+ const pu=(s.pool||[]).reduce((a,p)=>a+p.lockedUsers,0),pc=(s.pool||[]).reduce((a,p)=>a+p.maxUsers,0);
+ document.getElementById('misc').innerHTML=
+ '<div class="stat"><div class="v">'+(s.cacheHitRate*100).toFixed(1)+'%</div><div class="k">直链缓存命中率</div></div>'+
+ '<div class="stat"><div class="v">'+s.totalToday+'</div><div class="k">今日决策总数</div></div>'+
+ '<div class="stat"><div class="v">'+pu+'/'+pc+'</div><div class="k">池锁定占用</div></div>';}
+async function loadUsers(){const u=await api('/users');
+ document.getElementById('users').innerHTML=u.map(x=>'<tr><td class="mono">'+esc(x.id)+'</td><td><span class="tag '+(x.mode==='115'?'warn':'')+'">'+esc(x.mode)+'</span></td><td>'+esc(x.template)+'</td><td>'+x.sessions+'</td><td>'+x.ok+'/'+x.fail+'</td><td>'+(x.hasCookie?'<span class="tag ok">已设置</span>':'<span class="tag">未设置</span>')+'</td><td><button class="act ghost" onclick="editUser(\''+esc(x.id)+'\',\''+esc(x.mode)+'\',\''+esc(x.template)+'\')">编辑</button></td></tr>').join('');}
+async function editUser(id,mode,tpl){const m=prompt('模式（115=用自己网盘，pool=走分布式池）',mode);if(m!=='115'&&m!=='pool')return alert('模式只能是 115 或 pool');
+ const t=prompt('套餐模板（如 vip）',tpl)||tpl;
+ await api('/users/'+encodeURIComponent(id),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m,template:t})});loadUsers();}
+async function loadPool(){const p=await api('/pool');
+ document.getElementById('pool').innerHTML=p.map(x=>'<tr><td class="mono">'+esc(x.id)+'</td><td>'+(x.healthy?'<span class="tag ok">健康</span>':'<span class="tag bad">已摘除</span>')+'</td><td>'+x.lockedUsers+'</td><td>'+x.maxUsers+'</td><td><button class="act ghost" onclick="setHealth(\''+esc(x.id)+'\','+(!x.healthy)+')">'+(x.healthy?'摘除':'恢复')+'</button></td></tr>').join('');}
+async function setHealth(id,h){await api('/pool/'+encodeURIComponent(id)+'/health',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({healthy:h})});loadPool();}
+async function loadLogs(){const l=await api('/decisions?limit=50');
+ document.getElementById('logs').innerHTML=l.map(x=>'<tr><td class="mono">'+esc(x.at)+'</td><td class="mono">'+esc(x.userID)+'</td><td>'+esc(bn(x.branch))+'</td><td class="mono">'+esc(x.accountID)+'</td><td>'+x.elapsedMs+'</td><td>'+(x.allowed?'<span class="tag ok">允许</span>':'<span class="tag bad">'+esc(x.denyReason||'拒绝')+'</span>')+'</td></tr>').join('')||'<tr><td colspan=6>暂无</td></tr>';}
+async function loadCfg(){const c=await api('/config');
+ document.getElementById('cfg').innerHTML=Object.entries(c).map(([k,v])=>'<tr><td class="mono">'+esc(k)+'</td><td class="mono">'+esc(v)+'</td></tr>').join('');}
+if(TOKEN)loadDash();
+</script>
+</body>
+</html>
