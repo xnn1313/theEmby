@@ -1,0 +1,4 @@
+.env
+nb-gateway
+*.test
+*.out

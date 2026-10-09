@@ -1,0 +1,20 @@
+services:
+  nb-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nextemby-replay/gateway:latest
+    container_name: nb-gateway
+    restart: unless-stopped
+    ports:
+      - "8091:8091"
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
+      - NB_LISTEN=:8091
+      - NB_DB_PATH=/data/nextemby.db
+    volumes:
+      # SQLite 数据持久化。注意镜像以非 root 用户（65532）运行，
+      # 宿主机需先执行：mkdir -p data && sudo chown -R 65532:65532 data
+      - ./data:/data
