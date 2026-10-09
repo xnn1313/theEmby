@@ -41,12 +41,18 @@ docker compose logs -f nb-gateway
 
 ## Web 页面
 
-- 管理后台：`http://你的服务器IP:8091/nb/admin/`（token 见 `NB_ADMIN_TOKEN` 或容器日志）
+- 管理后台：`http://你的服务器IP:8091/nb/admin/`（首次访问设置管理密码，
+  之后密码登录；或 `NB_ADMIN_TOKEN` / 容器日志里的随机 token 兼容鉴权）
 - 个人中心：`http://你的服务器IP:8091/nb/me/?nb_user=lzy`
 
 ![管理后台](docs/admin.png)
 ![个人中心](docs/me.png)
 （截图待补充）
+
+管理后台 6 页面（控制台/用户管理/服务器配置/系统日志/缓存列表/系统设置）
+全部可配置可存：115 账号（含 Cookie 绑定）、路径映射（热更新）、并发/额度
+模板、用户（封禁/过期/额度）、系统配置键值、直链缓存管理、一键重启。
+完整 API 表见 [gateway/README.md](gateway/README.md#管理后台-api可配置项)。
 
 ## 本地开发
 
@@ -72,15 +78,20 @@ NB_UPSTREAM=https://embyf.bbstzb.org NB_API_KEY=你的Key go run ./cmd/nb-gatewa
 | `NB_LISTEN` | 否 | 监听地址，默认 `:8091` |
 | `NB_PATH_MAP` | 否 | 路径映射，默认 `/CloudNAS/CloudDrive/115open=/` |
 | `NB_HMAC_KEY` | 否 | `/nb/stream` 签发密钥，不设则启动时随机 |
-| `NB_115_COOKIE` | 否 | 115 池账号 Cookie（`UID=…;CID=…;SEID=…;`） |
+| `NB_115_COOKIE` | 否 | 115 池账号 Cookie（`UID=…;CID=…;SEID=…;`）；首次启动种子进 DB，之后以 DB 为准 |
 | `NB_115_ACCOUNT` | 否 | 池账号标识，默认 `115小1` |
-| `NB_115_SEED_COOKIE` | 否 | 115 种子账号 Cookie |
+| `NB_115_SEED_COOKIE` | 否 | 115 种子账号 Cookie；首次启动种子进 DB，之后以 DB 为准 |
 | `NB_115_SEED_ACCOUNT` | 否 | 种子账号标识，默认 `115大` |
+| `NB_ADMIN_TOKEN` | 否 | 管理后台兼容 token；不设则启动时随机生成并打印到日志 |
+| `NB_COOKIE_KEY` | 否 | 115 Cookie AES-GCM 加密密钥，不设则启动时随机 |
+| `NB_DB_PATH` | 否 | SQLite 路径，默认 `./nextemby.db`（docker 里 `/data/nextemby.db`） |
 | `SSL_CERT_FILE` | 否 | 自定义 CA bundle 路径 |
 
 ## 备注
 
-- 115 Cookie 请只用自己的小号测试，不要外传；Cookie 失效时容器启动即报错。
+- 115 Cookie 请只用自己的小号测试，不要外传；环境变量里的 Cookie 首次启动
+  种子进 DB（之后以 DB 为准，可在后台"服务器配置"里更换）。DB 中 Cookie
+  登录失效时记 error 日志并用演示 client 占位，不再导致启动失败。
 - 持久化：用户 / Cookie（AES-GCM）/ 播放记录 / 决策日志 / 池账号存 SQLite
   （`NB_DB_PATH`，docker 里为 `/data/nextemby.db` + volume）；直链缓存、24h 路由锁、
   并发计数为 transient 内存状态。

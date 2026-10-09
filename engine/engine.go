@@ -21,6 +21,10 @@ type Config struct {
 	LockTTL time.Duration
 	// Templates 并发模板名 -> 同播上限，如 {"vip": 5}。
 	Templates map[string]int
+	// TemplateOf 按名解析并发策略模板（如读 DB templates 表）；非 nil 时优先于
+	// Templates 使用。返回 (Template, false) 表示未命中，回退 DefaultLimit。
+	// MaxConcurrent<=0 的模板视为未配置，同样回退 DefaultLimit。
+	TemplateOf func(name string) (Template, bool)
 	// DefaultLimit 模板未命中时的默认同播上限。
 	DefaultLimit int
 	// ReceiveDir 秒传落盘目录（SPEC："/最近接收"）。
@@ -101,6 +105,12 @@ type Engine struct {
 	// 注意：调用是同步的，实现里不要做慢操作；不要回调 Engine 方法（避免死锁）。
 	OnDecision func(DecisionSummary)
 
+	// LogFunc 是可选的中文播放日志 hook：播放决策关键节点调用，
+	// category 取值 play | user | error | system，nil 时静默。
+	// 日志文案里绝不输出 Cookie / API Key 等敏感信息。
+	// 注意：调用是同步的，实现里不要做慢操作。
+	LogFunc func(category, message string)
+
 	decMu     sync.Mutex
 	decisions []DecisionSummary // 决策 ring buffer（最近 200 条，供管理后台）
 }
@@ -165,6 +175,7 @@ func (e *Engine) recordDecision(userID string, d Decision) DecisionSummary {
 		Allowed:    d.Allowed,
 		DenyReason: d.DenyReason,
 		AccountID:  d.AccountID,
+		UA:         d.UA,
 		Steps:      steps,
 	}
 	e.decMu.Lock()
@@ -237,12 +248,23 @@ func (e *Engine) Sessions(userID string) int {
 	return e.sessions[userID]
 }
 
+// resolveLimit 解析用户的同播上限：TemplateOf 非 nil 时优先使用它
+// （MaxConcurrent>0 才生效），否则走旧的 Templates map；
+// 解析失败或上限 <=0 时回退 DefaultLimit（保持旧语义）。
+func (e *Engine) resolveLimit(user User) int {
+	if e.cfg.TemplateOf != nil {
+		if t, ok := e.cfg.TemplateOf(user.Template); ok && t.MaxConcurrent > 0 {
+			return t.MaxConcurrent
+		}
+	} else if l := e.cfg.Templates[user.Template]; l > 0 {
+		return l
+	}
+	return e.cfg.DefaultLimit
+}
+
 // acquire 按模板做并发准入；成功返回释放函数。
 func (e *Engine) acquire(user User) (func(), bool) {
-	limit := e.cfg.Templates[user.Template]
-	if limit <= 0 {
-		limit = e.cfg.DefaultLimit
-	}
+	limit := e.resolveLimit(user)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.sessions[user.ID] >= limit {
@@ -363,6 +385,10 @@ func (e *Engine) Handle(ctx context.Context, req PlaybackRequest) (d Decision, e
 		}
 	}()
 
+	// User-Agent 透传：放在 defer 注册之后、GetUser 之前，
+	// 确保所有返回路径（允许/拒绝/异常）的决策都带 UA。
+	d.UA = req.UA
+
 	user, err := e.deps.Users.GetUser(ctx, req.UserID)
 	if err != nil {
 		return d, fmt.Errorf("engine: get user %q: %w", req.UserID, err)
@@ -373,14 +399,12 @@ func (e *Engine) Handle(ctx context.Context, req PlaybackRequest) (d Decision, e
 	release, ok := e.acquire(user)
 	step := StepTrace{Step: "concurrency", Duration: now().Sub(t0)}
 	if !ok {
-		limit := e.cfg.Templates[user.Template]
-		if limit <= 0 {
-			limit = e.cfg.DefaultLimit
-		}
+		limit := e.resolveLimit(user)
 		step.Branch = "denied"
 		step.Detail = fmt.Sprintf("template=%s limit=%d", user.Template, limit)
 		d.Steps = append(d.Steps, step)
 		d.Allowed, d.DenyReason, d.Branch = false, "concurrency_limit", BranchDeniedConcurrency
+		e.logf("error", "[普通模式]并发拒绝 用户：%s 原因：%s", user.ID, d.DenyReason)
 		return d, nil
 	}
 	d.Release = release
@@ -416,12 +440,19 @@ func (e *Engine) Handle(ctx context.Context, req PlaybackRequest) (d Decision, e
 	}
 	d.AccountID = accountID
 	d.Steps = append(d.Steps, StepTrace{Step: "resolve_account", Branch: routeBranch, Duration: now().Sub(t0), Detail: "account=" + accountID})
+	client := req.Client
+	if client == "" {
+		client = "-"
+	}
+	e.logf("play", "收到请求 用户：%s(%s) [%s] | 文件：%s | 大小：%s",
+		user.ID, accountID, client, req.FileName, formatSize(req.FileSize))
 
 	// ③ 直链缓存（TTL 10min）
 	t0 = now()
 	if url, hit := e.getCache(accountID, req.FileSHA1); hit {
 		d.Steps = append(d.Steps, StepTrace{Step: "cache", Branch: "hit", Duration: now().Sub(t0)})
 		d.Allowed, d.Branch, d.DirectURL = true, BranchCacheHit, url
+		e.logf("play", "[普通模式]缓存命中直连：%s -> %s -> %s", user.ID, accountID, req.FileName)
 		e.bumpStat(user.ID, true)
 		return d, nil
 	}
@@ -434,15 +465,18 @@ func (e *Engine) Handle(ctx context.Context, req PlaybackRequest) (d Decision, e
 		err = e.decidePool(ctx, &d, user, req, accountID)
 	}
 	if err != nil {
+		e.logf("error", "播放决策异常 用户：%s 文件：%s 错误：%v", user.ID, req.FileName, err)
 		return d, err
 	}
 	d.Allowed = true
 	return d, nil
 }
 
-// trace 辅助：记录一步并返回耗时起点重置。
-func (e *Engine) traceStep(d *Decision, t0 time.Time, name, branch, detail string) {
-	d.Steps = append(d.Steps, StepTrace{Step: name, Branch: branch, Duration: e.cfg.Now().Sub(t0), Detail: detail})
+// trace 辅助：记录一步并返回本步耗时（供日志打印毫秒数）。
+func (e *Engine) traceStep(d *Decision, t0 time.Time, name, branch, detail string) time.Duration {
+	dur := e.cfg.Now().Sub(t0)
+	d.Steps = append(d.Steps, StepTrace{Step: name, Branch: branch, Duration: dur, Detail: detail})
+	return dur
 }
 
 // finish 决策成功收尾：写缓存、记播放记录、统计成功。
@@ -462,9 +496,11 @@ func (e *Engine) failStat(userID string) { e.bumpStat(userID, false) }
 // decideOwn115：115 模式三步链路（SPEC §12）。
 func (e *Engine) decideOwn115(ctx context.Context, d *Decision, user User, req PlaybackRequest, drv DriveClient) error {
 	now := e.cfg.Now
+	short := shortSHA1(req.FileSHA1)
 
 	// STEP1：自有盘 SHA1 探测（~50ms，1 次 API）
 	t0 := now()
+	e.logf("play", "正在执行自有盘 SHA1 探测 (%s | SHA1: %s...)", drv.AccountID(), short)
 	hit, err := drv.ProbeSHA1(ctx, req.FileSHA1)
 	if err != nil {
 		e.traceStep(d, t0, "probe_own", "error", err.Error())
@@ -473,6 +509,7 @@ func (e *Engine) decideOwn115(ctx context.Context, d *Decision, user User, req P
 	}
 	if hit {
 		e.traceStep(d, t0, "probe_own", "hit", "")
+		e.logf("play", "[自备网盘模式]自有盘 SHA1 探测命中 | 用户：%s(%s)", user.ID, drv.AccountID())
 		t1 := now()
 		url, err := drv.DirectURL(ctx, req.FileSHA1)
 		if err != nil {
@@ -480,11 +517,13 @@ func (e *Engine) decideOwn115(ctx context.Context, d *Decision, user User, req P
 			e.failStat(user.ID)
 			return fmt.Errorf("engine: direct url: %w", err)
 		}
-		e.traceStep(d, t1, "direct_url", "ok", "")
+		ms := e.traceStep(d, t1, "direct_url", "ok", "").Milliseconds()
+		e.logf("play", "[自备网盘模式]直连成功：%s -> %s网盘 -> %s | 耗时：%dms", user.ID, user.ID, req.FileName, ms)
 		e.finish(ctx, d, user, req, BranchOwnDriveHit, url)
 		return nil
 	}
 	e.traceStep(d, t0, "probe_own", "miss", "")
+	e.logf("play", "[自备网盘模式]自有盘 SHA1 探测失败，文件不存在(%s | SHA1: %s...)", drv.AccountID(), short)
 
 	// STEP2：播放记录库 → 用户间秒传（本地毫秒级，零网盘 API 消耗）
 	t0 = now()
@@ -502,7 +541,9 @@ func (e *Engine) decideOwn115(ctx context.Context, d *Decision, user User, req P
 			e.failStat(user.ID)
 			return fmt.Errorf("engine: p2p rapid transfer: %w", err)
 		}
-		e.traceStep(d, t1, "rapid_transfer", "ok", fmt.Sprintf("src=p2p:%s dir=%s", other, dir))
+		ms := e.traceStep(d, t1, "rapid_transfer", "ok", fmt.Sprintf("src=p2p:%s dir=%s", other, dir)).Milliseconds()
+		e.logf("play", "[自备网盘模式]秒传成功：p2p:%s -> %s(%s) | 目录：%s | 文件：%s | 耗时：%dms",
+			other, user.ID, drv.AccountID(), dir, req.FileName, ms)
 		t1 = now()
 		url, err := drv.DirectURL(ctx, req.FileSHA1)
 		if err != nil {
@@ -510,7 +551,8 @@ func (e *Engine) decideOwn115(ctx context.Context, d *Decision, user User, req P
 			e.failStat(user.ID)
 			return fmt.Errorf("engine: direct url: %w", err)
 		}
-		e.traceStep(d, t1, "direct_url", "ok", "")
+		ms = e.traceStep(d, t1, "direct_url", "ok", "").Milliseconds()
+		e.logf("play", "[自备网盘模式]直连成功：%s -> %s网盘 -> %s | 耗时：%dms", user.ID, user.ID, req.FileName, ms)
 		e.finish(ctx, d, user, req, BranchP2PRapid, url)
 		return nil
 	}
@@ -518,13 +560,16 @@ func (e *Engine) decideOwn115(ctx context.Context, d *Decision, user User, req P
 
 	// STEP3：源盘兜底（100% 可用）
 	t1 := now()
+	e.logf("play", "正在尝试源网盘秒传：%s -> %s(%s)", e.cfg.SeedAccountID, user.ID, drv.AccountID())
 	dir, err := drv.RapidTransfer(ctx, req.FileSHA1, req.FileName, req.FileSize)
 	if err != nil {
 		e.traceStep(d, t1, "rapid_transfer", "error", "src=seed:"+e.cfg.SeedAccountID+" "+err.Error())
 		e.failStat(user.ID)
 		return fmt.Errorf("engine: seed rapid transfer: %w", err)
 	}
-	e.traceStep(d, t1, "rapid_transfer", "ok", fmt.Sprintf("src=seed:%s dir=%s", e.cfg.SeedAccountID, dir))
+	ms := e.traceStep(d, t1, "rapid_transfer", "ok", fmt.Sprintf("src=seed:%s dir=%s", e.cfg.SeedAccountID, dir)).Milliseconds()
+	e.logf("play", "[自备网盘模式]秒传成功：%s -> %s(%s) | 目录：%s | 文件：%s | 耗时：%dms",
+		e.cfg.SeedAccountID, user.ID, drv.AccountID(), dir, req.FileName, ms)
 	t1 = now()
 	url, err := drv.DirectURL(ctx, req.FileSHA1)
 	if err != nil {
@@ -532,7 +577,8 @@ func (e *Engine) decideOwn115(ctx context.Context, d *Decision, user User, req P
 		e.failStat(user.ID)
 		return fmt.Errorf("engine: direct url: %w", err)
 	}
-	e.traceStep(d, t1, "direct_url", "ok", "")
+	ms = e.traceStep(d, t1, "direct_url", "ok", "").Milliseconds()
+	e.logf("play", "[自备网盘模式]直连成功：%s -> %s网盘 -> %s | 耗时：%dms", user.ID, user.ID, req.FileName, ms)
 	e.finish(ctx, d, user, req, BranchSeedFallback, url)
 	return nil
 }
@@ -547,7 +593,9 @@ func (e *Engine) decidePool(ctx context.Context, d *Decision, user User, req Pla
 	}
 
 	// 全域 SHA1 探测
+	short := shortSHA1(req.FileSHA1)
 	t0 := now()
+	e.logf("play", "正在执行全域 SHA1 探测 (%s | SHA1: %s...)", accountID, short)
 	hit, err := drv.ProbeSHA1(ctx, req.FileSHA1)
 	if err != nil {
 		e.traceStep(d, t0, "probe_pool", "error", err.Error())
@@ -556,6 +604,7 @@ func (e *Engine) decidePool(ctx context.Context, d *Decision, user User, req Pla
 	}
 	if hit {
 		e.traceStep(d, t0, "probe_pool", "hit", "")
+		e.logf("play", "[普通模式]全域 SHA1 探测命中 | 用户：%s(%s)", user.ID, accountID)
 		t1 := now()
 		url, err := drv.DirectURL(ctx, req.FileSHA1)
 		if err != nil {
@@ -563,12 +612,14 @@ func (e *Engine) decidePool(ctx context.Context, d *Decision, user User, req Pla
 			e.failStat(user.ID)
 			return fmt.Errorf("engine: direct url: %w", err)
 		}
-		e.traceStep(d, t1, "direct_url", "ok", "")
+		ms := e.traceStep(d, t1, "direct_url", "ok", "").Milliseconds()
+		e.logf("play", "[普通模式]直连成功：%s -> %s网盘 -> %s | 耗时：%dms", user.ID, user.ID, req.FileName, ms)
 		// 探测命中不是秒传，不续期 24h 锁（让冷文件自然过期进入 GC，见 README）。
 		e.finish(ctx, d, user, req, BranchPoolProbeHit, url)
 		return nil
 	}
 	e.traceStep(d, t0, "probe_pool", "miss", "")
+	e.logf("play", "[普通模式]全域 SHA1 探测失败，文件不存在(%s | SHA1: %s...)", accountID, short)
 
 	// 神盾快速查库（按 sha1）
 	t0 = now()
@@ -579,6 +630,7 @@ func (e *Engine) decidePool(ctx context.Context, d *Decision, user User, req Pla
 	}
 	if sr.Found {
 		e.traceStep(d, t0, "shield_search", "hit", "share_code="+sr.ShareCode)
+		e.logf("play", "[普通模式]神盾快速查库命中该资源 (分享码：%s)", sr.ShareCode)
 		t1 := now()
 		if err := e.deps.Shield.TransferToPool(ctx, sr.Slug, e.cfg.ReceiveDir); err != nil {
 			e.traceStep(d, t1, "shield_transfer", "error", err.Error())
@@ -594,11 +646,13 @@ func (e *Engine) decidePool(ctx context.Context, d *Decision, user User, req Pla
 			e.failStat(user.ID)
 			return fmt.Errorf("engine: direct url: %w", err)
 		}
-		e.traceStep(d, t1, "direct_url", "ok", "")
+		ms := e.traceStep(d, t1, "direct_url", "ok", "").Milliseconds()
+		e.logf("play", "[普通模式]直连成功：%s -> %s网盘 -> %s | 耗时：%dms", user.ID, user.ID, req.FileName, ms)
 		e.finish(ctx, d, user, req, BranchPoolShieldHit, url)
 		return nil
 	}
 	e.traceStep(d, t0, "shield_search", "miss", "")
+	e.logf("play", "[普通模式]神盾快速查库未命中该资源 (文件：%s)", req.FileName)
 
 	// 神盾未命中：后台触发主动搜索（尽力而为，不阻塞）+ 前台源网盘秒传兜底
 	if req.TMDBID != "" {
@@ -610,13 +664,16 @@ func (e *Engine) decidePool(ctx context.Context, d *Decision, user User, req Pla
 		}
 	}
 	t1 := now()
+	e.logf("play", "正在尝试源网盘秒传：%s -> %s(%s)", e.cfg.SeedAccountID, user.ID, accountID)
 	dir, err := drv.RapidTransfer(ctx, req.FileSHA1, req.FileName, req.FileSize)
 	if err != nil {
 		e.traceStep(d, t1, "rapid_transfer", "error", "src=seed:"+e.cfg.SeedAccountID+" "+err.Error())
 		e.failStat(user.ID)
 		return fmt.Errorf("engine: pool seed rapid transfer: %w", err)
 	}
-	e.traceStep(d, t1, "rapid_transfer", "ok", fmt.Sprintf("src=seed:%s dir=%s", e.cfg.SeedAccountID, dir))
+	ms := e.traceStep(d, t1, "rapid_transfer", "ok", fmt.Sprintf("src=seed:%s dir=%s", e.cfg.SeedAccountID, dir)).Milliseconds()
+	e.logf("play", "[普通模式]秒传成功：%s -> %s(%s) | 目录：%s | 文件：%s | 耗时：%dms",
+		e.cfg.SeedAccountID, user.ID, accountID, dir, req.FileName, ms)
 	e.renewLock(user.ID, accountID)
 	t1 = now()
 	url, err := drv.DirectURL(ctx, req.FileSHA1)
@@ -625,7 +682,8 @@ func (e *Engine) decidePool(ctx context.Context, d *Decision, user User, req Pla
 		e.failStat(user.ID)
 		return fmt.Errorf("engine: direct url: %w", err)
 	}
-	e.traceStep(d, t1, "direct_url", "ok", "")
+	ms = e.traceStep(d, t1, "direct_url", "ok", "").Milliseconds()
+	e.logf("play", "[普通模式]直连成功：%s -> %s网盘 -> %s | 耗时：%dms", user.ID, user.ID, req.FileName, ms)
 	e.finish(ctx, d, user, req, BranchPoolSeedFallback, url)
 	return nil
 }

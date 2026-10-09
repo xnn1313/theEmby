@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -23,6 +22,9 @@ type webUIState struct {
 
 	mu          sync.Mutex
 	userClients map[string]engine.DriveClient // userID -> 自有 115 client（懒加载缓存）
+
+	sessMu   sync.Mutex
+	sessions map[string]time.Time // 登录 session token -> 过期时间（24h）
 }
 
 // EnableWebUI 启用管理后台与个人中心（重复调用会覆盖旧配置）。
@@ -32,28 +34,7 @@ func (s *Server) EnableWebUI(adminToken string, cookies CookieStore, validateCoo
 		cookies:        cookies,
 		validateCookie: validateCookie,
 		userClients:    map[string]engine.DriveClient{},
-	}
-}
-
-// requireAdmin 是管理后台鉴权中间件：Authorization: Bearer 或 ?token=。
-// token 比对用常量时间比较；webUI 未启用时直接 404。
-func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if s.webUI == nil {
-			http.NotFound(w, r)
-			return
-		}
-		var tok string
-		if ah := r.Header.Get("Authorization"); strings.HasPrefix(ah, "Bearer ") {
-			tok = strings.TrimPrefix(ah, "Bearer ")
-		} else {
-			tok = r.URL.Query().Get("token")
-		}
-		if subtle.ConstantTimeCompare([]byte(tok), []byte(s.webUI.adminToken)) != 1 {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		next(w, r)
+		sessions:       map[string]time.Time{},
 	}
 }
 
@@ -144,6 +125,15 @@ type adminUserJSON struct {
 	HasCookie bool   `json:"hasCookie"`
 	OK        int64  `json:"ok"`
 	Fail      int64  `json:"fail"`
+	ExpiresAt int64  `json:"expiresAt"`
+	Banned    bool   `json:"banned"`
+	Remark    string `json:"remark"`
+	Plays30d  int    `json:"plays30d"`
+	LastUA    string `json:"lastUA"`
+	// Drive：115 模式显示"自备网盘"，池模式显示"负载均衡"。
+	Drive string `json:"drive"`
+	// DriveOk：池模式恒 true；115 模式 = 用户是否已绑 Cookie。
+	DriveOk bool `json:"driveOk"`
 }
 
 func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
@@ -170,6 +160,18 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 	out := make([]adminUserJSON, 0, len(users))
 	for _, u := range users {
 		st := stats[u.ID]
+		drive, driveOk := "负载均衡", true
+		if u.Mode == engine.ModeOwn115 {
+			drive = "自备网盘"
+			driveOk = s.webUI.cookies.HasCookie(r.Context(), u.ID)
+		}
+		var plays30d int
+		var lastUA string
+		if s.db != nil {
+			if p, ua, err := s.db.UserActivity(r.Context(), u.ID); err == nil {
+				plays30d, lastUA = p, ua
+			}
+		}
 		out = append(out, adminUserJSON{
 			ID:        u.ID,
 			Mode:      u.Mode,
@@ -178,6 +180,13 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 			HasCookie: s.webUI.cookies.HasCookie(r.Context(), u.ID),
 			OK:        st.OK,
 			Fail:      st.Fail,
+			ExpiresAt: u.ExpiresAt,
+			Banned:    u.Banned,
+			Remark:    u.Remark,
+			Plays30d:  plays30d,
+			LastUA:    lastUA,
+			Drive:     drive,
+			DriveOk:   driveOk,
 		})
 	}
 	writeJSON(w, out)
@@ -186,19 +195,18 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAdminUpdateUser(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var body struct {
-		Mode     string `json:"mode"`
-		Template string `json:"template"`
+		Mode      string  `json:"mode"`
+		Template  *string `json:"template"`
+		ExpiresAt *int64  `json:"expiresAt"`
+		Banned    *bool   `json:"banned"`
+		Remark    *string `json:"remark"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if body.Mode != engine.ModeOwn115 && body.Mode != engine.ModePool {
+	if body.Mode != "" && body.Mode != engine.ModeOwn115 && body.Mode != engine.ModePool {
 		http.Error(w, "mode must be 115 or pool", http.StatusBadRequest)
-		return
-	}
-	if body.Template == "" {
-		http.Error(w, "template must not be empty", http.StatusBadRequest)
 		return
 	}
 	updater, ok := s.engine.Users().(engine.UserUpdater)
@@ -211,7 +219,22 @@ func (s *Server) handleAdminUpdateUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown user", http.StatusNotFound)
 		return
 	}
-	u.Mode, u.Template = body.Mode, body.Template
+	// 只更新提供的字段（指针字段区分"不传"与"置空/零值"）。
+	if body.Mode != "" {
+		u.Mode = body.Mode
+	}
+	if body.Template != nil {
+		u.Template = *body.Template
+	}
+	if body.ExpiresAt != nil {
+		u.ExpiresAt = *body.ExpiresAt
+	}
+	if body.Banned != nil {
+		u.Banned = *body.Banned
+	}
+	if body.Remark != nil {
+		u.Remark = *body.Remark
+	}
 	if err := updater.UpdateUser(r.Context(), u); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

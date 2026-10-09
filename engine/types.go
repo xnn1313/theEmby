@@ -39,6 +39,7 @@ type PlaybackRequest struct {
 	Client    string // 客户端标识，如 "Filmly" / "VidHub"
 	TMDBID    string // 上游 Emby 的 tmdb_id（神盾主动搜索用，可空）
 	MediaType string // "movie" / "tv"
+	UA        string // HTTP User-Agent 原始值（透传进决策与日志）
 }
 
 // StepTrace 记录决策链中某一步的分支与耗时，方便以后打日志
@@ -57,6 +58,7 @@ type Decision struct {
 	Branch     string      // 走的主分支（见 Branch* 常量）
 	DirectURL  string      // 决策出的直链（缓存命中或现取）
 	AccountID  string      // 实际服务的 115 账号（用户自有盘或池账号如 "115小2"）
+	UA         string      // 请求的 HTTP User-Agent 原始值（由 Handle 从请求透传）
 	Steps      []StepTrace // 每步分支 + 耗时
 	Release    func()      // 播放结束时调用以释放会话；拒绝时为 nil
 }
@@ -87,9 +89,19 @@ func (d Decision) Summary() string {
 
 // User 是 NextEmby 侧的用户记录。
 type User struct {
-	ID       string
-	Mode     string // ModeOwn115 / ModePool
-	Template string // 并发策略模板，如 "vip"
+	ID        string
+	Mode      string // ModeOwn115 / ModePool
+	Template  string // 并发策略模板，如 "vip"
+	ExpiresAt int64  // 过期时间（unix 秒）；0=永不过期
+	Banned    bool   // 是否被封禁
+	Remark    string // 备注
+}
+
+// Template 是并发策略模板（读 DB templates 表）。
+type Template struct {
+	Name          string
+	MaxConcurrent int
+	MaxDevices    int
 }
 
 // PoolAccount 是分布式池中的一个 115 服务账号（如 "115小2"）。
@@ -116,6 +128,7 @@ type DecisionSummary struct {
 	Allowed    bool
 	DenyReason string
 	AccountID  string
+	UA         string
 	Steps      []StepTrace
 }
 

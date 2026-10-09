@@ -137,8 +137,9 @@ go build -o nb-gateway ./cmd/nb-gateway
 
 零第三方依赖：Go `embed` 内嵌两个单文件页面（vanilla JS + fetch）。
 
-- **管理后台** `GET /nb/admin/`：鉴权 `NB_ADMIN_TOKEN`（`Authorization: Bearer`
-  或 `?token=`；未设置时启动日志打印随机 token）。
+- **管理后台** `GET /nb/admin/`：鉴权 = 密码登录（session cookie，
+  `POST /nb/admin/api/login`，首次访问设置密码）或 `NB_ADMIN_TOKEN`
+ （`Authorization: Bearer` 或 `?token=`；未设置时启动日志打印随机 token）。
   - 总览：今日各分支决策计数、直链缓存命中率、池账号锁定占用
   - 用户：列表（模式/套餐/并发/成功失败/Cookie 状态），可改模式与模板
   - 池账号：健康/锁定用户数/上限，可手动摘除/恢复（调 `SetHealthy`）
@@ -164,3 +165,104 @@ JSON API（管理后台统一 `/nb/admin/api/` 前缀 + 鉴权；个人中心 `/
 | GET | `/nb/me/api/profile?nb_user=` | 个人档案 + 统计 + 近期播放 |
 | POST | `/nb/me/api/cookie?nb_user=` | `{cookie}` 保存（先 LoginCheck） |
 | POST | `/nb/me/api/mode?nb_user=` | `{mode}` 切换模式 |
+
+## 管理后台 API（可配置项）
+
+所有后台页面（控制台/用户管理/服务器配置/系统日志/缓存列表/系统设置）
+都经本节 API 读写配置，配置持久化在 SQLite，重启不丢失。
+
+### 鉴权
+
+`POST /nb/admin/api/login`（不鉴权）、`GET /nb/admin/api/login/status`
+（不鉴权）、`POST /nb/admin/api/logout`（不鉴权）之外的全部
+`/nb/admin/api/*` 需鉴权，三选一：
+
+1. 登录 session：登录成功后 `Set-Cookie: nb_session=...`（HttpOnly，
+   `Path=/nb/admin/`，`SameSite=Lax`，24h 有效）；
+2. `Authorization: Bearer <NB_ADMIN_TOKEN>`；
+3. `?token=<NB_ADMIN_TOKEN>`。
+
+`webUI` 未启用时全部返回 404。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/nb/admin/api/login` | `{password}` 登录；首次 `{new_password}` 设置密码；`{password,new_password,change:true}`（已登录）改密码。成功 `{ok:true}` + session cookie；失败 401 `{error}` |
+| GET | `/nb/admin/api/login/status` | `{passwordSet}` 是否已设置管理密码 |
+| POST | `/nb/admin/api/logout` | 删 session、清 cookie，`{ok:true}` |
+
+密码 hash 格式 `v1$<saltHex>$<hex(sha256(salt+password))>`（salt 16 字节随机），
+存在 `settings.admin.password_hash`，**永不返回、永不打日志**。
+
+### 完整 API 表
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/nb/admin/api/stats` | 今日分支统计、缓存命中率、池占用 |
+| GET | `/nb/admin/api/decisions?limit=50` | 播放决策日志（DB 全量） |
+| GET | `/nb/admin/api/config` | 配置查看：upstream/listen/pathMap（脱敏） |
+| GET | `/nb/admin/api/settings?prefix=` | 配置键值（`admin.password_hash` 永不返回；`nextfind.agent_key` 掩码；附带 `admin.cookie_bound`: "1"/"0"） |
+| PUT | `/nb/admin/api/settings` | `{k:v}` 批量写；拒绝写 `admin.password_hash`（400） |
+| GET | `/nb/admin/api/accounts` | 115 账号列表：`{id,name,kind,hasCookie,cookieMask,uid,maxUsers,lockedUsers,healthy,enabled,rapidDir,quota}`（cookie 明文永不返回） |
+| POST | `/nb/admin/api/accounts` | `{id*,name,kind*,cookie,uid,maxUsers,enabled,rapidDir}`；cookie 非空先 LoginCheck，失效 400；kind 非法 400 |
+| PUT | `/nb/admin/api/accounts/{id}` | patch（只更新提供的字段；cookie 非空先校验再存，不提供则保留旧值） |
+| DELETE | `/nb/admin/api/accounts/{id}` | 删除账号（含 cookie 密文） |
+| GET | `/nb/admin/api/pathmaps` | 路径映射 `[{embyPath,accountId,subPath}]` |
+| POST | `/nb/admin/api/pathmaps` | `{embyPath*,accountId*,subPath}`；accountId 必须在 accounts115 存在；改动后自动 ReloadPathMaps（热更新） |
+| DELETE | `/nb/admin/api/pathmaps/{embyPath}` | embyPath 需 URL 编码；改动后自动 ReloadPathMaps |
+| GET | `/nb/admin/api/templates` | 并发/额度策略模板列表 |
+| POST | `/nb/admin/api/templates` | body 即模板对象，`{name*,maxConcurrent,maxDevices,defaultLine,dailyPlays,uidTaskLimit,lockHours,dailyRapid,giftDays,expireDeleteDays}` |
+| PUT | `/nb/admin/api/templates/{name}` | body 即模板对象（以路径 name 为准） |
+| DELETE | `/nb/admin/api/templates/{name}` | 不允许删最后一个模板（400） |
+| GET | `/nb/admin/api/users` | 用户列表：`{id,mode,template,sessions,hasCookie,ok,fail,expiresAt,banned,remark,plays30d,lastUA,drive,driveOk}`（drive: 115 模式"自备网盘"/池模式"负载均衡"） |
+| POST | `/nb/admin/api/users` | `{id*,mode,template,expiresAt,remark}`；重复 id → 409 |
+| PUT | `/nb/admin/api/users/{id}` | patch：`{mode,template,expiresAt,banned,remark}`（只更新提供的字段） |
+| DELETE | `/nb/admin/api/users/{id}` | 删除用户 |
+| GET | `/nb/admin/api/logs?category=&limit=200` | 系统日志 `[{id,ts,category,message}]`（limit 上限 1000） |
+| DELETE | `/nb/admin/api/logs` | 清空系统日志 |
+| GET | `/nb/admin/api/cache` | 直链缓存 `[{user,filename,accountUID,ua,expiresAt,sha1}]` |
+| DELETE | `/nb/admin/api/cache` | 清空直链缓存 |
+| DELETE | `/nb/admin/api/cache/{user}/{sha1}` | 删除单条缓存，`{ok}` |
+| GET | `/nb/admin/api/console?range=24h\|7d\|30d` | 控制台：播放聚合 + 系统状态（见下） |
+| POST | `/nb/admin/api/restart` | `{ok:true}` 后 500ms 进程退出（由 supervisor/docker 拉起） |
+
+### console 返回
+
+```json
+{
+  "range": "24h", "total": 120,
+  "transfer": 40, "direct": 75, "cookie": 12,
+  "sourceRate": 0.97,
+  "cpu": 12.5, "memMB": 38.4, "diskUsed": 123456, "diskTotal": 987654,
+  "timeline": [{"t": 1728384000, "plays": 5}],
+  "uaStats": [{"name": "Filmly", "plays": 60, "directs": 40}]
+}
+```
+
+- `transfer`：秒传类分支（p2p_rapid/seed_fallback/pool_shield_transfer/pool_seed_fallback）
+- `direct`：直连类分支（cache_hit/own_drive_hit/pool_probe_hit）
+- `cookie`：115 模式相关分支（own_drive_hit/p2p_rapid/seed_fallback）
+- `sourceRate`：成功率 OK/Total
+- `uaStats`：UA 归一到 Filmly / VidHub / 网易爆米花 / Emby / 其他，按 plays 倒序
+- `cpu`：/proc/stat 两次采样（50ms 间隔）使用率，非 Linux 为 0
+
+### settings 键表
+
+| key | 说明 | 生效 |
+|---|---|---|
+| `emby.addr` / `emby.port` | 上游 Emby 地址/端口（覆盖 `NB_UPSTREAM`，scheme 沿用） | 重启 |
+| `emby.proxy_port` | 网关监听端口（覆盖 `NB_LISTEN`，如 `8091`） | 重启 |
+| `nextfind.agent_key` | 神盾/NextFind OpenAPI 密钥（读取时掩码展示） | 实时读 |
+| `admin.password_hash` | 管理密码 hash（只经 login API 写，永不返回） | 实时 |
+| `admin.cookie_bound` | 只读加算：是否有 kind=seed 且已绑 cookie 的账号 | — |
+
+### 路径映射热更新
+
+`ReloadPathMaps()`：DB `path_maps` 非空则用 DB（`sub_path` 空→`"/"`，
+按 Emby 前缀长短排序沿用 `ParsePathMap` 逻辑），否则回退 `NB_PATH_MAP`
+环境变量解析。pathmaps 的 POST/DELETE 后自动调用，指纹解析器内部换成
+`DynamicMapper`（每次解析取最新规则），无需重启。
+
+### 重启
+
+`POST /nb/admin/api/restart` 先回 `{ok:true}`，500ms 后 `os.Exit(0)`。
+docker-compose 下容器自动拉起；systemd 部署需配 `Restart=always`。
