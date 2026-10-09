@@ -1,4 +1,4 @@
 .env
-nb-gateway
+/nb-gateway
 *.test
 *.out
