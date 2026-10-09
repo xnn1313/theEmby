@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -92,6 +93,23 @@ func (s *Server) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	logURL := sanitizeURL(r.URL)
 
+	userID := userIDFromRequest(r)
+
+	// 播放前置检查（仅 DB 接入时）：封禁/过期/模板日额度。命中直接拒绝，不走上游。
+	if s.db != nil {
+		if code := s.checkPlayAllowed(ctx, userID); code != "" {
+			status := http.StatusTooManyRequests
+			if code == "user_banned" || code == "user_expired" {
+				status = http.StatusForbidden
+			}
+			s.logger.Printf("playbackinfo 前置拒绝 user=%s error=%s", userID, code)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": code})
+			return
+		}
+	}
+
 	status, upBody, err := s.fetchUpstreamPlaybackInfo(r)
 	if err != nil {
 		s.logger.Printf("playbackinfo 上游失败 %s: %v", logURL, err)
@@ -121,7 +139,6 @@ func (s *Server) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := userIDFromRequest(r)
 	for _, rs := range rawSources {
 		src, ok := rs.(map[string]any)
 		if !ok {
@@ -149,6 +166,7 @@ func (s *Server) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 			FileName: name,
 			FileSize: size,
 			Client:   clientFromEmbyAuth(r),
+			UA:       r.UserAgent(),
 		})
 		if err != nil {
 			// 引擎异常（如未知用户）：降级透传，不中断播放。
@@ -167,7 +185,14 @@ func (s *Server) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 		}
 
 		token := issueStreamToken(s.hmacKey, d.AccountID, sha1, time.Now())
-		s.rememberStreamURL(token, d.DirectURL)
+		s.rememberStreamURL(token, StreamInfo{
+			URL:       d.DirectURL,
+			UserID:    userID,
+			SHA1:      sha1,
+			AccountID: d.AccountID,
+			Filename:  name,
+			UA:        r.UserAgent(),
+		})
 		src["DirectStreamUrl"] = "/nb/stream?t=" + token
 
 		// MVP：会话保持到 token 过期后释放；后续可接 Sessions/Playing/Stopped 做精确释放。
@@ -187,4 +212,53 @@ func (s *Server) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(out)
+}
+
+// checkPlayAllowed 是播放前置检查（仅 DB 接入时调用）：
+// banned → user_banned；过期 → user_expired；模板日额度超限 → daily_limit /
+// daily_rapid_limit。返回 "" 表示放行。用户不存在时不拦截（引擎会降级透传）。
+func (s *Server) checkPlayAllowed(ctx context.Context, userID string) string {
+	user, err := s.engine.Users().GetUser(ctx, userID)
+	if err != nil {
+		return ""
+	}
+	if user.Banned {
+		s.logUser("用户 %s 已被禁用，拒绝播放", userID)
+		return "user_banned"
+	}
+	if user.ExpiresAt != 0 && time.Now().Unix() > user.ExpiresAt {
+		s.logUser("用户 %s 已过期，拒绝播放", userID)
+		return "user_expired"
+	}
+	t, found, err := s.db.GetTemplate(ctx, user.Template)
+	if err != nil || !found {
+		return ""
+	}
+	now := time.Now()
+	midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).Unix()
+	if t.DailyPlays > 0 {
+		n, err := s.db.CountUserDecisionsSince(ctx, userID, midnight)
+		if err == nil && n >= t.DailyPlays {
+			s.logUser("用户 %s 触发今日播放上限（%d 次），拒绝播放", userID, t.DailyPlays)
+			return "daily_limit"
+		}
+	}
+	if t.DailyRapid > 0 {
+		n, err := s.db.CountUserRapidSince(ctx, userID, midnight)
+		if err == nil && n >= t.DailyRapid {
+			s.logUser("用户 %s 触发今日秒传上限（%d 次），拒绝播放", userID, t.DailyRapid)
+			return "daily_rapid_limit"
+		}
+	}
+	return ""
+}
+
+// handleStopped 处理客户端的 Sessions/Playing/Stopped 信号：
+// 只打一条 play 日志，然后原样透传给上游（不吞掉）。会话释放仍由现有
+// token 过期机制处理，这里不做任何"虚拟会话"清理。
+func (s *Server) handleStopped(w http.ResponseWriter, r *http.Request) {
+	client := clientFromEmbyAuth(r)
+	user := userIDFromRequest(r)
+	s.logPlay("收到客户端 Stopped 信号 (%s, %s)", client, user)
+	s.proxy.ServeHTTP(w, r)
 }

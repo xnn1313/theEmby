@@ -61,19 +61,15 @@ func ParsePathMap(s string) ([]PathRule, error) {
 	return rules, nil
 }
 
-// PathMapper 按规则把 Emby 库路径映射为 115 网盘路径。
-type PathMapper struct {
-	rules []PathRule
+// Mapper115 是"Emby 路径 → 115 网盘路径"的映射接口：
+// PathMapper（静态规则）与 DynamicMapper（每次调用 load 取最新）都实现它。
+type Mapper115 interface {
+	Map115(embyPath string) (string, bool)
 }
 
-// NewPathMapper 创建映射器（rules 为 nil 表示无映射，全部 miss）。
-func NewPathMapper(rules []PathRule) *PathMapper {
-	return &PathMapper{rules: rules}
-}
-
-// Map115 返回 embyPath 对应的 115 路径；无规则命中返回 ok=false。
-func (m *PathMapper) Map115(embyPath string) (string, bool) {
-	for _, r := range m.rules {
+// matchPathRules 按规则做最长前缀匹配（PathMapper 与 DynamicMapper 共用）。
+func matchPathRules(rules []PathRule, embyPath string) (string, bool) {
+	for _, r := range rules {
 		p := r.EmbyPrefix
 		if p == "" {
 			continue
@@ -89,6 +85,43 @@ func (m *PathMapper) Map115(embyPath string) (string, bool) {
 	return "", false
 }
 
+// PathMapper 按规则把 Emby 库路径映射为 115 网盘路径。
+type PathMapper struct {
+	rules []PathRule
+}
+
+// NewPathMapper 创建映射器（rules 为 nil 表示无映射，全部 miss）。
+func NewPathMapper(rules []PathRule) *PathMapper {
+	return &PathMapper{rules: rules}
+}
+
+// Map115 返回 embyPath 对应的 115 路径；无规则命中返回 ok=false。
+func (m *PathMapper) Map115(embyPath string) (string, bool) {
+	if m == nil {
+		return "", false
+	}
+	return matchPathRules(m.rules, embyPath)
+}
+
+// DynamicMapper 是动态映射器：每次 Map115 都调 load() 取最新规则，
+// 供网关 ReloadPathMaps 热更新用。
+type DynamicMapper struct {
+	load func() []PathRule
+}
+
+// NewDynamicMapper 创建动态映射器。
+func NewDynamicMapper(load func() []PathRule) *DynamicMapper {
+	return &DynamicMapper{load: load}
+}
+
+// Map115 实现 Mapper115。
+func (m *DynamicMapper) Map115(embyPath string) (string, bool) {
+	if m == nil || m.load == nil {
+		return "", false
+	}
+	return matchPathRules(m.load(), embyPath)
+}
+
 // ---------------------------------------------------------------- 实时解析
 
 // SHA1Fetcher 按 115 网盘路径实时取文件 sha1。
@@ -101,21 +134,31 @@ type SHA1Fetcher interface {
 
 // LiveFingerprintResolver 是生产形态的解析器：
 // embyPath → 路径映射 → 实时调 115 取 sha1。不预扫，无快照。
+// mapper 是接口：默认静态 PathMapper，网关 ReloadPathMaps 后换成 DynamicMapper。
 type LiveFingerprintResolver struct {
-	mapper  *PathMapper
+	mapper  Mapper115
 	fetcher SHA1Fetcher // nil 时恒 miss（优雅降级）
 }
 
 // NewLiveFingerprintResolver 创建解析器。fetcher 为 nil 时恒 miss。
 func NewLiveFingerprintResolver(mapper *PathMapper, fetcher SHA1Fetcher) *LiveFingerprintResolver {
+	var m Mapper115 = mapper
 	if mapper == nil {
-		mapper = NewPathMapper(nil)
+		m = NewPathMapper(nil)
 	}
-	return &LiveFingerprintResolver{mapper: mapper, fetcher: fetcher}
+	return &LiveFingerprintResolver{mapper: m, fetcher: fetcher}
+}
+
+// SetMapper 替换路径映射器（ReloadPathMaps 热更新用）。
+func (r *LiveFingerprintResolver) SetMapper(m Mapper115) {
+	r.mapper = m
 }
 
 // ResolveSHA1 实现 FingerprintResolver。
 func (r *LiveFingerprintResolver) ResolveSHA1(ctx context.Context, embyPath string) (string, bool) {
+	if r.mapper == nil {
+		return "", false
+	}
 	path115, ok := r.mapper.Map115(embyPath)
 	if !ok || r.fetcher == nil {
 		return "", false
