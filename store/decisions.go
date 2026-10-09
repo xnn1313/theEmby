@@ -24,10 +24,10 @@ func (s *Store) LogDecision(sum engine.DecisionSummary) error {
 		ok = 1
 	}
 	_, err = s.db.Exec(
-		`INSERT INTO decisions(user_id, branch, account_id, sha1, elapsed_ms, ok, steps_json, created_at)
-		 VALUES(?,?,?,?,?,?,?,?)`,
+		`INSERT INTO decisions(user_id, branch, account_id, sha1, elapsed_ms, ok, steps_json, ua, created_at)
+		 VALUES(?,?,?,?,?,?,?,?,?)`,
 		sum.UserID, sum.Branch, sum.AccountID, "", sum.ElapsedMs(), ok,
-		string(stepsJSON), sum.At.Unix(),
+		string(stepsJSON), sum.UA, sum.At.Unix(),
 	)
 	if err != nil {
 		return fmt.Errorf("store: log decision: %w", err)
@@ -79,14 +79,14 @@ func (s *Store) UserStats(ctx context.Context) (map[string]engine.StatPair, erro
 // RecentDecisions 返回最近 limit 条决策（按写入倒序；管理后台播放日志用）。
 func (s *Store) RecentDecisions(ctx context.Context, limit int) ([]engine.DecisionSummary, error) {
 	return s.queryDecisions(ctx,
-		`SELECT user_id, branch, account_id, elapsed_ms, ok, steps_json, created_at
+		`SELECT user_id, branch, account_id, elapsed_ms, ok, steps_json, ua, created_at
 		 FROM decisions ORDER BY id DESC LIMIT ?`, limit)
 }
 
 // RecentUserDecisions 返回某用户最近 limit 条决策（个人中心用）。
 func (s *Store) RecentUserDecisions(ctx context.Context, userID string, limit int) ([]engine.DecisionSummary, error) {
 	return s.queryDecisions(ctx,
-		`SELECT user_id, branch, account_id, elapsed_ms, ok, steps_json, created_at
+		`SELECT user_id, branch, account_id, elapsed_ms, ok, steps_json, ua, created_at
 		 FROM decisions WHERE user_id=? ORDER BY id DESC LIMIT ?`, userID, limit)
 }
 
@@ -103,7 +103,7 @@ func (s *Store) queryDecisions(ctx context.Context, query string, args ...any) (
 		var stepsJSON string
 		var createdAt int64
 		var elapsedMs int64
-		if err := rows.Scan(&d.UserID, &d.Branch, &d.AccountID, &elapsedMs, &okInt, &stepsJSON, &createdAt); err != nil {
+		if err := rows.Scan(&d.UserID, &d.Branch, &d.AccountID, &elapsedMs, &okInt, &stepsJSON, &d.UA, &createdAt); err != nil {
 			return nil, fmt.Errorf("store: query decisions scan: %w", err)
 		}
 		d.Allowed = okInt != 0

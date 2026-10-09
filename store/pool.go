@@ -9,7 +9,8 @@ import (
 )
 
 // PoolStore 是 engine.PoolStore 的 SQLite 实现：分布式池 115 服务账号的
-// 列表与健康状态。（24h 路由锁的记账仍在 Engine 内存，见 engine.go。）
+// 列表与健康状态，读/写 accounts115（kind='pool' 且 enabled=1 的行）。
+// （24h 路由锁的记账仍在 Engine 内存，见 engine.go。）
 type PoolStore struct{ db *sql.DB }
 
 // Pool 返回池账号存储。
@@ -21,19 +22,20 @@ func (p *PoolStore) EnsureAccount(ctx context.Context, accountID string, maxUser
 		maxUsers = 4
 	}
 	if _, err := p.db.ExecContext(ctx,
-		`INSERT INTO pool_accounts(id, max_users, healthy, updated_at)
-		 VALUES(?,?,1,?)
+		`INSERT INTO accounts115(id, name, kind, uid, max_users, healthy, enabled, rapid_dir, quota_info, updated_at)
+		 VALUES(?,?,'pool','',?,1,1,'/最近接收','',?)
 		 ON CONFLICT(id) DO NOTHING`,
-		accountID, maxUsers, nowUnix()); err != nil {
+		accountID, accountID, maxUsers, nowUnix()); err != nil {
 		return fmt.Errorf("store: ensure pool account: %w", err)
 	}
 	return nil
 }
 
-// ListAccounts 返回全部池账号（按 ID 排序）。
+// ListAccounts 返回全部启用的池账号（按 ID 排序）。
 func (p *PoolStore) ListAccounts(ctx context.Context) ([]engine.PoolAccount, error) {
 	rows, err := p.db.QueryContext(ctx,
-		`SELECT id, max_users, healthy FROM pool_accounts ORDER BY id`)
+		`SELECT id, max_users, healthy FROM accounts115
+		 WHERE kind='pool' AND enabled=1 ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list pool accounts: %w", err)
 	}
@@ -59,7 +61,7 @@ func (p *PoolStore) SetHealthy(ctx context.Context, accountID string, healthy bo
 		h = 1
 	}
 	res, err := p.db.ExecContext(ctx,
-		`UPDATE pool_accounts SET healthy=?, updated_at=? WHERE id=?`,
+		`UPDATE accounts115 SET healthy=?, updated_at=? WHERE id=?`,
 		h, nowUnix(), accountID)
 	if err != nil {
 		return fmt.Errorf("store: set pool healthy: %w", err)
